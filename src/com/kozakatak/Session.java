@@ -41,8 +41,6 @@ public class Session implements Runnable {
     public static final String CLIENT_TYPE = "JAVA_KAT";
     public static final String CLIENT_VERSION = "0.0.1";
 
-    public static final int RECONNECT_TIME_MS = 1000;
-
     private int heartbeatInterval = 0;
     private int heartbeatTimeoutInterval = 0;
     private boolean heartbeatAwaitingSend = false;
@@ -52,9 +50,10 @@ public class Session implements Runnable {
 
     private long lastMessageTime = 0;
 
-    public int maxReconnectAttempts = 10;
-
     private boolean connected = false;
+
+    private Map<String, MessageListener> routeCallbacks;
+    private Map<Integer, MessageListener> requestCallbacks;
 
     private String host;
     private int port;
@@ -64,6 +63,7 @@ public class Session implements Runnable {
     private InputStream in;
     private PrintStream log;
     private Gson gson;
+    private int lastMessageID = 1;
 
     public Session(String host, int port) {
         this.host = host;
@@ -73,6 +73,8 @@ public class Session implements Runnable {
         heartbeatTimer = new Timer();
         heartbeatTimeoutTimer = new Timer();
         log = System.out;
+        routeCallbacks = new HashMap<>();
+        requestCallbacks = new HashMap<>();
     }
 
     public void setLog(PrintStream s) {
@@ -109,7 +111,6 @@ public class Session implements Runnable {
         this.connected = false;
         heartbeatTimer.cancel();
         heartbeatTimeoutTimer.cancel();
-        // todo: end timers.
     }
 
     @Override
@@ -127,18 +128,13 @@ public class Session implements Runnable {
                 int length = in.read() << 16 | in.read() << 8 | in.read();
                 byte[] bytes = new byte[length];
 
+                //noinspection ResultOfMethodCallIgnored
                 in.read(bytes, 0, length);
-                JsonElement raw = new JsonParser().parse(new String(bytes));
-                JsonObject obj = null;
-                if (raw.isJsonObject()) {
-                    obj = (JsonObject)raw;
-                }
-
-                processPackage(type, obj);
+                processPackage(type, bytes);
                 Thread.yield();
             }
         } catch (IOException e) {
-            e.printStackTrace(log);
+            fatalError(e);
         }
 
         try {
@@ -149,24 +145,40 @@ public class Session implements Runnable {
         }
     }
 
-    private void processPackage(int type, JsonObject obj) {
+
+
+    ///////////////////////////////////////////////////////////////////////
+    ///////////////////////////// PROCESSORS //////////////////////////////
+    ///////////////////////////////////////////////////////////////////////
+
+    private void processPackage(int type, byte[] bytes) {
         switch (type) {
             case TYPE_HANDSHAKE:
-                processHandshake(obj);
+                processHandshake(bytes);
                 break;
             case TYPE_HEARTBEAT:
                 processHeartbeat();
                 break;
             case TYPE_DATA:
+                processMessage(bytes);
                 break;
             case TYPE_KICK:
+                processKick(bytes);
                 break;
         }
 
         lastMessageTime = System.currentTimeMillis();
     }
 
-    private void processHandshake(JsonObject obj) {
+    private void processHandshake(byte[] bytes) {
+
+        JsonElement element = (new JsonParser()).parse(new String(bytes));
+        if (!element.isJsonObject()) {
+            return;
+        }
+
+        JsonObject obj = element.getAsJsonObject();
+
         JsonPrimitive codeElement = obj.getAsJsonPrimitive("code");
         if (codeElement == null || !codeElement.isNumber()) {
             return;
@@ -243,6 +255,68 @@ public class Session implements Runnable {
 
     }
 
+    private void processMessage(byte[] bytes) {
+
+        IncomingMessage msg = decodeMessage(bytes);
+        if (msg == null) {
+            return;
+        }
+
+        if (msg.isIDType()) {
+            MessageListener l = requestCallbacks.get(msg.getId());
+            if (l != null) {
+                l.call(msg.getObject());
+                requestCallbacks.remove(msg.getId());
+                log.println(msg.getId());
+            } else {
+                log.println("Invalid response with id " + msg.getId());
+            }
+        }
+
+        if (msg.isRouteType()) {
+            MessageListener l = routeCallbacks.get(msg.getRoute());
+            if (l != null) {
+                l.call(msg.getObject());
+                routeCallbacks.remove(msg.getRoute());
+            } else {
+                log.println("Invalid route.");
+            }
+        }
+    }
+
+    private void processKick(byte[] bytes) {
+        // TODO: onKick
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    /////////////////////////////// SENDERS ///////////////////////////////
+    ///////////////////////////////////////////////////////////////////////
+
+
+    public void notify(String route, MessageListener cb) { notify(route, new JsonObject(), cb); }
+    public void notify(String route, JsonObject data, MessageListener cb) {
+        byte[] msg = encodeMessage(0, TYPE_REQUEST, route, data);
+        if (msg != null) {
+            send(TYPE_DATA, msg);
+        }
+    }
+
+
+    public void request(String route, MessageListener cb) { request(route, new JsonObject(), cb); }
+    public void request(String route, JsonObject data, MessageListener cb) {
+        int id = lastMessageID++;
+
+        byte[] msg = encodeMessage(id, TYPE_REQUEST, route, data);
+        if (msg != null) {
+            requestCallbacks.put(id, cb);
+            send(TYPE_DATA, msg);
+        }
+    }
+
+
+    ///////////////////////////////////////////////////////////////////////
+    ///////////////////////////// ELEMENTARY //////////////////////////////
+    ///////////////////////////////////////////////////////////////////////
 
 
     private JsonElement getHandshake() {
@@ -263,33 +337,196 @@ public class Session implements Runnable {
         return handshake;
     }
 
-    public boolean send(int type, byte[] bytes) {
+    private boolean performHandshake() {
+        return send(TYPE_HANDSHAKE, getHandshake());
+    }
+
+    private boolean send(int type, byte[] bytes) {
         try {
             out.write(encode(type, bytes));
             out.flush();
 
         } catch (IOException e) {
-            e.printStackTrace(log);
+            fatalError(e);
+
             return false;
         }
 
         return true;
     }
 
-    public boolean send(int type, JsonElement element) {
-        try {
-            byte[] bytes = gson.toJson(element).getBytes();
-            return send(type, bytes);
-        } catch (JsonSyntaxException e) {
-            e.printStackTrace(log);
+    private boolean send(int type, JsonElement element) {
+        return send(type, gson.toJson(element).getBytes());
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    ////////////////////////////// HANDLERS ///////////////////////////////
+    ///////////////////////////////////////////////////////////////////////
+
+    private void fatalError(Exception e) {
+        e.printStackTrace();
+    }
+
+
+    public void on(String route, MessageListener l) {
+        if (routeCallbacks.get(route) != null) {
+            log.println("There is a duplicate entry of route " + route);
         }
-        return false;
+
+        routeCallbacks.put(route, l);
     }
 
-    private boolean performHandshake() {
-        return send(TYPE_HANDSHAKE, getHandshake());
+    ///////////////////////////////////////////////////////////////////////
+    ////////////////////////////// PROTOCOLS //////////////////////////////
+    ///////////////////////////////////////////////////////////////////////
+
+    private boolean msgHasId(int type) {
+        return type == TYPE_REQUEST || type == TYPE_RESPONSE;
     }
 
+    private boolean msgHasRoute(int type) {
+        return type == TYPE_REQUEST || type == TYPE_PUSH || type == TYPE_NOTIFY;
+    }
+
+    private int calculateMsgIDBytes(int id) {
+        int len = 0;
+        do {
+            len += 1;
+            id >>= 7;
+        } while(id > 0);
+        return len;
+    }
+
+    private IncomingMessage decodeMessage(byte[] buffer) {
+        byte[] bytes =  buffer.clone();
+        int offset = 0;
+        int id = -1;
+        String route = null;
+
+        // parse flag
+        byte flag = bytes[offset++];
+        byte type = (byte)((flag >> 1) & MSG_TYPE_MASK);
+
+
+
+        // parse id
+        if(msgHasId(type)) {
+            int m;
+            int i = 0;
+            do{
+                m = bytes[offset++];
+                id = (int)(id + ((m & 0x7f) * Math.pow(2,(7*i++)))) + 1;
+            } while(m >= 128);
+        }
+
+        // parse route
+        if(msgHasRoute(type)) {
+            int routeLen = bytes[offset++];
+            if(routeLen > 0) {
+                byte[] bRoute = new byte[routeLen];
+                System.arraycopy(bytes, offset, bRoute, 0, routeLen);
+                route = new String(bRoute);
+            } else {
+                route = null;
+            }
+            offset += routeLen;
+        }
+
+        // parse body
+        int bodyLen = bytes.length - offset;
+        byte[] body = new byte[bodyLen];
+        System.arraycopy(bytes, offset, body, 0, bodyLen);
+
+        JsonElement element = (new JsonParser()).parse(new String(body));
+        if (!element.isJsonObject()) {
+            return null;
+        }
+
+        if (id >= 0) {
+            return new IncomingMessage(type, id, (JsonObject)element);
+        }
+
+
+        if (route != null) {
+            return new IncomingMessage(type, route, (JsonObject)element);
+        }
+
+        return null;
+
+    }
+
+    private byte[] encodeMessage(int id, int type, String route, JsonObject msg) {
+
+        // message type has an id
+        int msgLen = MSG_FLAG_BYTES;
+        if (type == TYPE_REQUEST || type == TYPE_RESPONSE) {
+            msgLen += calculateMsgIDBytes(id);
+        }
+
+        // message type has a route
+        byte[] bRoute = new byte[0];
+        if (type == TYPE_REQUEST || type == TYPE_PUSH || type == TYPE_NOTIFY) {
+            msgLen += MSG_ROUTE_LEN_BYTES;
+            if (route != null) {
+                bRoute = route.getBytes();
+                if (bRoute.length > 255) {
+                    log.println("Route is too long.");
+                    return null;
+                } else {
+                    msgLen += bRoute.length;
+                }
+            }
+        }
+
+        byte[] bMsg = new byte[0];
+        if (msg != null) {
+            bMsg = gson.toJson(msg).getBytes();
+            msgLen += bMsg.length;
+        }
+
+        byte[] buffer = new byte[msgLen];
+        int offset = 0;
+
+        // write flag to buffer
+        buffer[offset] = (byte) ((type << 1) & 0xFF);
+        offset = offset + MSG_FLAG_BYTES;
+
+
+        // write id to bugger
+        if (type == TYPE_REQUEST || type == TYPE_RESPONSE) {
+            do{
+                int tmp = id % 128;
+                int next = (int)Math.floor(id/128);
+
+                if(next != 0){
+                    tmp = tmp + 128;
+                }
+                buffer[offset++] = (byte) (tmp & 0xFF);
+
+                id = next;
+            } while(id != 0);
+        }
+
+        // write route to buffer
+        if (type == TYPE_REQUEST || type == TYPE_PUSH || type == TYPE_NOTIFY) {
+            if(bRoute.length > 0) {
+                buffer[offset++] = (byte) (bRoute.length & 0xff);
+                for (byte aBRoute : bRoute) {
+                    buffer[offset++] = aBRoute;
+                }
+            } else {
+                buffer[offset++] = 0;
+            }
+        }
+
+        // write body to buffer
+        for (byte aBMsg : bMsg) {
+            buffer[offset++] = aBMsg;
+        }
+
+
+        return buffer;
+    }
 
     /**
      * Package protocol encode.
@@ -309,7 +546,7 @@ public class Session implements Runnable {
      *   1 - 3: big-endian body length
      * Body: body length bytes
      */
-    private static byte[] encode(int type, byte[] body) {
+    private byte[] encode(int type, byte[] body) {
         int length = body.length;
         byte[] buffer = new byte[length + PKG_HEAD_BYTES];
         int index = 0;
@@ -319,16 +556,17 @@ public class Session implements Runnable {
         buffer[index++] = (byte)(length & 0xff);
 
         if(length > 0) {
-            System.arraycopy(buffer, index, body, 0, length);
+            System.arraycopy(body, 0, buffer, index, length);
         }
+
         return buffer;
     }
 
-    private static ArrayList<IncomingMessage> decode(byte[] buffer) {
+    private static ArrayList<BaseIncomingMessage> decode(byte[] buffer) {
         int offset = 0;
         byte[] bytes = buffer.clone();
         int length = 0;
-        ArrayList<IncomingMessage> messages = new ArrayList<>();
+        ArrayList<BaseIncomingMessage> messages = new ArrayList<>();
         while(offset < bytes.length) {
 
             int type = bytes[offset++];
@@ -339,19 +577,69 @@ public class Session implements Runnable {
             offset += length;
 
             JsonObject obj = (JsonObject) (new JsonParser().parse(new String(bytes)));
-            IncomingMessage msg = new IncomingMessage(type, obj);
+            BaseIncomingMessage msg = new BaseIncomingMessage(type, obj);
             messages.add(msg);
         }
         return messages;
     }
 
+
+    ///////////////////////////////////////////////////////////////////////
+    /////////////////////////// MESSAGE HOLDERS ///////////////////////////
+    ///////////////////////////////////////////////////////////////////////
+
     static class IncomingMessage {
+
+
+        private int type;
+        private int id = -1;
+        private String route = null;
+        private JsonObject data;
+
+        IncomingMessage(int type, int id, JsonObject data) {
+            this.type = type;
+            this.id = id;
+            this.data = data;
+        }
+
+        IncomingMessage(int type, String route, JsonObject data) {
+            this.type = type;
+            this.route = route;
+            this.data = data;
+        }
+
+        public boolean isIDType() {
+            return id >= 0;
+        }
+
+        public boolean isRouteType() {
+            return route != null;
+        }
+
+        public int getType() {
+            return type;
+        }
+
+        public int getId() {
+            return id;
+        }
+
+        public String getRoute() {
+            return route;
+        }
+
+        public JsonObject getObject() {
+            return data;
+        }
+    }
+
+    static class BaseIncomingMessage {
 
 
         private int type;
         private JsonObject body;
 
-        public IncomingMessage(int type, JsonObject body) {
+        public BaseIncomingMessage(int type, JsonObject body) {
             this.type = type;
             this.body = body;
         }
@@ -364,9 +652,21 @@ public class Session implements Runnable {
         public JsonObject getBody() {
             return body;
         }
-
-
-
     }
+
+    public interface MessageListener {
+        void call(JsonObject obj);
+    }
+
+    /*******************
+     *  CALLBACKS: (apart from routing)
+     *  - onHandshake
+     *  - onHeartbeatReceived
+     *  - onClose
+     *  - onKick
+     *  - onFatalError
+     *  -
+     *
+     */
 
 }

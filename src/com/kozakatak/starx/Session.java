@@ -1,6 +1,7 @@
 package com.kozakatak.starx;
 
 import com.google.gson.*;
+import sun.plugin2.message.Message;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -57,6 +58,8 @@ public class Session implements Runnable {
     private long lastMessageTime = 0;
 
     private boolean connected = false;
+    private boolean doConnect = false;
+    private boolean running = true;
 
     private Map<String, MessageListener> routeCallbacks;
     private Map<Integer, MessageListener> requestCallbacks;
@@ -70,6 +73,7 @@ public class Session implements Runnable {
     private PrintStream log;
     private Gson gson;
     private int lastMessageID = 1;
+    private ArrayList<byte[]> outBuffer;
 
     public Session(String host, int port) {
         this.host = host;
@@ -79,51 +83,48 @@ public class Session implements Runnable {
         heartbeatTimer = new Timer();
         heartbeatTimeoutTimer = new Timer();
         log = System.out;
-        routeCallbacks = new HashMap<>();
-        requestCallbacks = new HashMap<>();
+        routeCallbacks = new HashMap<String, MessageListener>();
+        requestCallbacks = new HashMap<Integer, MessageListener>();
+        outBuffer = new ArrayList<byte[]>();
     }
 
     public void setLog(PrintStream s) {
         log = s;
     }
 
-    public boolean connect() {
+    public void connect() {
+        doConnect = true;
+    }
 
+    private boolean executeConnect() {
 
         if (connected) {
             return true;
         }
 
-        log.println("Connecting...");
-
         try {
             Socket s = new Socket(this.host, this.port);
             out = s.getOutputStream();
             in = s.getInputStream();
-            connected = performHandshake();
-            if (!connected) {
-                return false;
-            }
-
-            thread.start();
-            log.println("Connected");
+            performHandshake();
+            return true;
 
         } catch (IOException e) {
             log.println("Could not connect to " + host + ":" + String.valueOf(port));
             e.printStackTrace(log);
             return false;
         }
-
-        return true;
     }
 
 
     public boolean isConnected() {
-        return true;
+        return connected;
     }
 
     public void close() {
+        outBuffer.clear();
         this.connected = false;
+        this.running = false;
         heartbeatTimer.cancel();
         heartbeatTimeoutTimer.cancel();
     }
@@ -132,20 +133,39 @@ public class Session implements Runnable {
     public void run() {
 
         try {
-            while (connected) {
-                int type = in.read();
-                if (type == -1) {
-                    connected = false;
-                    log.println("End of stream reached.");
-                    break;
+            while (running) {
+
+                if (doConnect) {
+                    connected = this.executeConnect();
                 }
 
-                int length = in.read() << 16 | in.read() << 8 | in.read();
-                byte[] bytes = new byte[length];
 
-                //noinspection ResultOfMethodCallIgnored
-                in.read(bytes, 0, length);
-                processPackage(type, bytes);
+
+                if (connected) {
+
+                    // write bytes out
+                    while (outBuffer.size() > 0) {
+                        out.write(outBuffer.get(0));
+                        outBuffer.remove(0);
+                    }
+                    out.flush();
+
+                    // read bytes in
+                    int type = in.read();
+                    if (type == -1) {
+                        connected = false;
+                        log.println("End of stream reached.");
+                        break;
+                    }
+
+                    int length = in.read() << 16 | in.read() << 8 | in.read();
+                    byte[] bytes = new byte[length];
+
+                    //noinspection ResultOfMethodCallIgnored
+                    in.read(bytes, 0, length);
+                    processPackage(type, bytes);
+                }
+
                 Thread.yield();
             }
         } catch (IOException e) {
@@ -155,9 +175,7 @@ public class Session implements Runnable {
         try {
             in.close();
             out.close();
-        } catch (IOException e) {
-            e.printStackTrace(log);
-        }
+        } catch (IOException ignored) {}
     }
 
 
@@ -359,26 +377,17 @@ public class Session implements Runnable {
         return handshake;
     }
 
-    private boolean performHandshake() {
-        return send(TYPE_HANDSHAKE, getHandshake());
+    private void performHandshake() {
+        send(TYPE_HANDSHAKE, getHandshake());
     }
 
-    private boolean send(int type, byte[] bytes) {
-        try {
-            out.write(encode(type, bytes));
-            out.flush();
-
-        } catch (IOException e) {
-            fatalError(e);
-
-            return false;
-        }
-
-        return true;
+    private void send(int type, byte[] bytes) {
+        byte[] encodedBytes = encode(type, bytes);
+        outBuffer.add(encodedBytes);
     }
 
-    private boolean send(int type, JsonElement element) {
-        return send(type, gson.toJson(element).getBytes());
+    private void send(int type, JsonElement element) {
+        send(type, gson.toJson(element).getBytes());
     }
 
     ///////////////////////////////////////////////////////////////////////
@@ -589,7 +598,7 @@ public class Session implements Runnable {
         int offset = 0;
         byte[] bytes = buffer.clone();
         int length = 0;
-        ArrayList<BaseIncomingMessage> messages = new ArrayList<>();
+        ArrayList<BaseIncomingMessage> messages = new ArrayList<BaseIncomingMessage>();
         while(offset < bytes.length) {
 
             int type = bytes[offset++];

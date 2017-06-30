@@ -43,12 +43,8 @@ public class Tests {
 
 
     public static void itConnectsToTheServer() {
-        Session s = new Session("localhost", 3250);
-        if (!s.connect()) {
-            return;
-        }
-
-
+        final Session s = new Session("localhost", 3250);
+        s.connect();
 
         s.on("JoinGame", new JoinGame());
         s.on("SearchStateMessage", new OnSearchStateMessage());
@@ -56,7 +52,7 @@ public class Tests {
         s.on("onKick", new OnKick());
 
 
-        JsonObject login = new JsonObject();
+        final JsonObject login = new JsonObject();
         login.addProperty("name", "Bill");
         Timer timer = new Timer();
         timer.schedule(new TimerTask() {

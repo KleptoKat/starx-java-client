@@ -18,62 +18,70 @@ public class Tests {
         }
     }
 
-    static class OnSearchStateMessage implements Session.MessageListener {
-        @Override
-        public void call(JsonObject obj) {
-
-        }
-    }
-
-    static class OnGameStateMessage implements Session.MessageListener {
-        @Override
-        public void call(JsonObject obj) {
-
-        }
-    }
-
-    static class OnKick implements Session.MessageListener {
-        @Override
-        public void call(JsonObject obj) {
-
-        }
-    }
 
 
 
-
-    public static void itConnectsToTheServer() {
+    public static void itConnectsToTheServerAndRegisters() {
         final Session s = new Session("localhost", 3250);
         s.connect();
-
+        s.start();
         s.on("JoinGame", new JoinGame());
-        s.on("SearchStateMessage", new OnSearchStateMessage());
-        s.on("GameStateMessage", new OnGameStateMessage());
-        s.on("onKick", new OnKick());
 
-
-        final JsonObject login = new JsonObject();
-        login.addProperty("name", "Bill");
-        Timer timer = new Timer();
-        timer.schedule(new TimerTask() {
+        s.setHeartbeatCallback(new Session.CallbackListener() {
             @Override
-            public void run() {
-                s.request("Manager.Register", login, new Session.MessageListener() {
+            public void call() {
+                System.out.println("HEARTBEAT RECEIVED.");
+            }
+        });
+
+        s.setHandshakeCallback(new Session.CallbackListener() {
+            @Override
+            public void call() {
+                System.out.println("handshake!");
+                JsonObject obj = new JsonObject();
+                obj.addProperty("name", "bill");
+
+                s.request("Manager.Register", obj, new Session.MessageListener() {
                     @Override
                     public void call(JsonObject obj) {
-                        System.out.println("wow");
-                    }
-                });
-                s.request("Manager.Authenticate", login, new Session.MessageListener() {
-                    @Override
-                    public void call(JsonObject obj) {
-                        System.out.println(obj.get("code").getAsInt());
+                        System.out.println(obj);
+                        final int id = obj.get("data").getAsJsonObject().get("id").getAsNumber().intValue();
+                        String key = obj.get("data").getAsJsonObject().get("key").getAsString();
+
+                        JsonObject auth = new JsonObject();
+                        auth.addProperty("id", id);
+                        auth.addProperty("key", key);
+
+
+                        s.request("Manager.Authenticate", auth, new Session.MessageListener() {
+                            @Override
+                            public void call(JsonObject obj) {
+                                System.out.println(obj);
+                                JsonObject acc = new JsonObject();
+                                acc.addProperty("account_id", id);
+                                s.request("Manager.RetrieveAccountInfo", acc, new Session.MessageListener() {
+                                    @Override
+                                    public void call(JsonObject obj) {
+                                        System.out.println(obj);
+
+
+
+                                    }
+                                });
+
+                            }
+                        });
                     }
                 });
             }
-        }, 800);
+        });
 
-
+        s.setConnectFailedCallback(new Session.CallbackListener() {
+            @Override
+            public void call() {
+                System.out.println("Could not connect.");
+            }
+        });
 
 
     }

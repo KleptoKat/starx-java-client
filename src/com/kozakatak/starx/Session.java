@@ -1,7 +1,6 @@
 package com.kozakatak.starx;
 
 import com.google.gson.*;
-import sun.plugin2.message.Message;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -45,6 +44,9 @@ public class Session implements Runnable {
     public static final int MSG_COMPRESS_ROUTE_MASK = 0x1;
     public static final int MSG_TYPE_MASK = 0x7;
 
+    private static final int MAX_CONNECT_ATTEMPTS = 4;
+    private static final int RECONNECT_INTERVAL = 1500;
+
     public static final String CLIENT_TYPE = "JAVA_KAT";
     public static final String CLIENT_VERSION = "0.0.1";
 
@@ -61,17 +63,20 @@ public class Session implements Runnable {
     private boolean doConnect = false;
     private boolean running = true;
 
-    private Map<String, MessageListener> routeCallbacks;
-    private Map<Integer, MessageListener> requestCallbacks;
+    private long connectAt = 0;
+    private int connectAttempts = 0;
 
     private String host;
     private int port;
     private Thread thread;
+    private Socket s;
 
     private OutputStream out;
     private InputStream in;
-    private PrintStream log;
     private Gson gson;
+
+    private Map<String, MessageListener> routeCallbacks;
+    private Map<Integer, MessageListener> requestCallbacks;
     private int lastMessageID = 1;
     private ArrayList<byte[]> outBuffer;
 
@@ -82,14 +87,27 @@ public class Session implements Runnable {
         gson = new GsonBuilder().create();
         heartbeatTimer = new Timer();
         heartbeatTimeoutTimer = new Timer();
-        log = System.out;
         routeCallbacks = new HashMap<String, MessageListener>();
         requestCallbacks = new HashMap<Integer, MessageListener>();
         outBuffer = new ArrayList<byte[]>();
+
+        fatalErrorCallback = new ExceptionListener() {
+            @Override
+            public void call(Exception e) {
+                e.printStackTrace();
+            }
+        };
+
+        errorCallback = new ExceptionListener() {
+            @Override
+            public void call(Exception e) {
+                e.printStackTrace();
+            }
+        };
     }
 
-    public void setLog(PrintStream s) {
-        log = s;
+    public void start() {
+        thread.start();
     }
 
     public void connect() {
@@ -98,20 +116,16 @@ public class Session implements Runnable {
 
     private boolean executeConnect() {
 
-        if (connected) {
-            return true;
-        }
-
         try {
-            Socket s = new Socket(this.host, this.port);
+            s = new Socket(this.host, this.port);
             out = s.getOutputStream();
             in = s.getInputStream();
             performHandshake();
             return true;
 
         } catch (IOException e) {
-            log.println("Could not connect to " + host + ":" + String.valueOf(port));
-            e.printStackTrace(log);
+            resetConnection();
+            onFatalError(e);
             return false;
         }
     }
@@ -121,63 +135,112 @@ public class Session implements Runnable {
         return connected;
     }
 
-    public void close() {
+    private void resetConnection()
+    {
+        boolean wasConnected = connected;
+
+        if (outBuffer == null) {
+            outBuffer = new ArrayList<byte[]>();
+        }
         outBuffer.clear();
-        this.connected = false;
+        connected = false;
+        if (heartbeatTimer != null) {
+            heartbeatTimer.cancel();
+        }
+
+        if (heartbeatTimeoutTimer != null) {
+            heartbeatTimeoutTimer.cancel();
+        }
+
+        if (wasConnected) {
+            onDisconnect();
+        }
+    }
+
+    public void close() {
+        resetConnection();
         this.running = false;
-        heartbeatTimer.cancel();
-        heartbeatTimeoutTimer.cancel();
+        onClose();
+    }
+
+    private void doWrite() throws IOException {
+        if (outBuffer.size() > 0) {
+            // write bytes out
+            while (outBuffer.size() > 0) {
+                if (outBuffer.get(0) != null) {
+                    out.write(outBuffer.get(0));
+                    outBuffer.remove(0);
+                }
+            }
+            out.flush();
+        }
+    }
+
+    private void doRead() throws IOException {
+        if (in.available() > 0) {
+            // read bytes in
+            int type = in.read();
+            if (type == -1) {
+                resetConnection();
+                return;
+            }
+
+            int length = in.read() << 16 | in.read() << 8 | in.read();
+            byte[] bytes = new byte[length];
+
+            //noinspection ResultOfMethodCallIgnored
+            in.read(bytes, 0, length);
+            processPackage(type, bytes);
+        }
     }
 
     @Override
     public void run() {
 
-        try {
-            while (running) {
-
-                if (doConnect) {
+        while (running) {
+            try {
+                if (!connected && (doConnect || (connectAt > 0 && connectAt < System.currentTimeMillis()))) {
+                    connectAt = 0;
+                    doConnect = false;
                     connected = this.executeConnect();
+
+                    if (connected) {
+                        onConnect();
+                        connectAttempts = 0;
+                    } else {
+                        onConnectFailed();
+                        if (connectAttempts < MAX_CONNECT_ATTEMPTS) {
+                            connectAt = System.currentTimeMillis() + RECONNECT_INTERVAL;
+                        }
+                        connectAttempts++;
+                    }
                 }
-
-
 
                 if (connected) {
-
-                    // write bytes out
-                    while (outBuffer.size() > 0) {
-                        out.write(outBuffer.get(0));
-                        outBuffer.remove(0);
-                    }
-                    out.flush();
-
-                    // read bytes in
-                    int type = in.read();
-                    if (type == -1) {
-                        connected = false;
-                        log.println("End of stream reached.");
-                        break;
-                    }
-
-                    int length = in.read() << 16 | in.read() << 8 | in.read();
-                    byte[] bytes = new byte[length];
-
-                    //noinspection ResultOfMethodCallIgnored
-                    in.read(bytes, 0, length);
-                    processPackage(type, bytes);
+                    doWrite();
+                    doRead();
                 }
 
+            } catch (IOException e) {
+                onFatalError(e);
+                close();
+            } finally {
                 Thread.yield();
             }
-        } catch (IOException e) {
-            fatalError(e);
         }
 
+
         try {
+            s.close();
             in.close();
             out.close();
         } catch (IOException ignored) {}
     }
 
+
+    public Socket getSocket() {
+        return s;
+    }
 
 
     ///////////////////////////////////////////////////////////////////////
@@ -220,13 +283,14 @@ public class Session implements Runnable {
         int code = codeElement.getAsInt();
 
         if (code == RES_OLD_CLIENT) {
-            log.println("Error, old client");
-            // TODO: error handling on connect.
+            onFatalError(new OldClientException());
+            resetConnection();
             return;
         }
 
         if (code != RES_OK) {
-            log.println("Error, handshake fail");
+            resetConnection();
+            onFatalError(new HandshakeException());
             return;
         }
 
@@ -242,6 +306,7 @@ public class Session implements Runnable {
 
         // do handshake callback here
         send(TYPE_HANDSHAKE_ACK, new byte[] {});
+        onHandshake();
 
     }
 
@@ -277,14 +342,15 @@ public class Session implements Runnable {
                     public void run() {
                         if (awaitingHeartbeatFromServer &&
                                 lastMessageTime + heartbeatTimeoutInterval - 100 < System.currentTimeMillis()) {
-                            log.println("The server timed out.");
-                            close();
+                            onFatalError(new ServerTimeoutException());
+                            resetConnection();
                         }
                     }
                 }, heartbeatTimeoutInterval);
             }
         }, heartbeatInterval);
 
+        onHeartbeat();
 
     }
 
@@ -300,9 +366,8 @@ public class Session implements Runnable {
             if (l != null) {
                 l.call(msg.getObject());
                 requestCallbacks.remove(msg.getId());
-                log.println(msg.getId());
             } else {
-                log.println("Invalid response with id " + msg.getId());
+                onError(new InvalidMessageException());
             }
         }
 
@@ -312,13 +377,24 @@ public class Session implements Runnable {
                 l.call(msg.getObject());
                 routeCallbacks.remove(msg.getRoute());
             } else {
-                log.println("Invalid route.");
+                onError(new InvalidMessageException());
             }
         }
     }
 
     private void processKick(byte[] bytes) {
-        // TODO: onKick
+
+        try {
+            JsonElement element = (new JsonParser()).parse(new String(bytes));
+            if (element != null && element.isJsonObject()) {
+                onKick(element.getAsJsonObject());
+            }
+
+        } catch(JsonSyntaxException e) {
+            onKick(null);
+        } finally {
+            resetConnection();
+        }
     }
 
     ///////////////////////////////////////////////////////////////////////
@@ -348,7 +424,9 @@ public class Session implements Runnable {
 
         byte[] msg = encodeMessage(id, TYPE_REQUEST, route, data);
         if (msg != null) {
-            requestCallbacks.put(id, cb);
+            if (cb != null) {
+                requestCallbacks.put(id, cb);
+            }
             send(TYPE_DATA, msg);
         }
     }
@@ -394,18 +472,73 @@ public class Session implements Runnable {
     ////////////////////////////// HANDLERS ///////////////////////////////
     ///////////////////////////////////////////////////////////////////////
 
-    private void fatalError(Exception e) {
-        e.printStackTrace();
+    private CallbackListener handshakeCallback;
+    private CallbackListener heartbeatCallback;
+    private CallbackListener closeCallback;
+    private CallbackListener disconnectCallback;
+    private MessageListener kickCallback;
+    private CallbackListener connectCallback;
+    private CallbackListener connectFailedCallback;
+    private ExceptionListener fatalErrorCallback;
+    private ExceptionListener errorCallback;
+
+    private void onClose() { if (closeCallback != null) closeCallback.call(); }
+    private void onHeartbeat() { if (heartbeatCallback != null) heartbeatCallback.call(); }
+    private void onHandshake() { if (handshakeCallback != null) handshakeCallback.call(); }
+    private void onKick(JsonObject obj) { if (kickCallback != null) kickCallback.call(obj); }
+    private void onDisconnect() { if (disconnectCallback != null) disconnectCallback.call(); }
+    private void onConnect() { if (connectCallback != null) connectCallback.call(); }
+    private void onConnectFailed() { if (connectFailedCallback != null) connectFailedCallback.call(); }
+    private void onFatalError(Exception e) { if (fatalErrorCallback != null) fatalErrorCallback.call(e); }
+    private void onError(Exception e) { if (errorCallback != null) errorCallback.call(e); }
+
+
+    public void setHandshakeCallback(CallbackListener handshakeCallback) {
+        this.handshakeCallback = handshakeCallback;
+    }
+
+    public void setHeartbeatCallback(CallbackListener heartbeatCallback) {
+        this.heartbeatCallback = heartbeatCallback;
+    }
+
+    public void setCloseCallback(CallbackListener closeCallback) {
+        this.closeCallback = closeCallback;
+    }
+
+    public void setDisconnectCallback(CallbackListener disconnectCallback) {
+        this.disconnectCallback = disconnectCallback;
+    }
+
+    public void setKickCallback(MessageListener kickCallback) {
+        this.kickCallback = kickCallback;
     }
 
 
-    public void on(String route, MessageListener l) {
+    public void setConnectCallback(CallbackListener connectCallback) {
+        this.connectCallback = connectCallback;
+    }
+
+    public void setConnectFailedCallback(CallbackListener connectFailedCallback) {
+        this.connectFailedCallback = connectFailedCallback;
+    }
+
+    public void setFatalErrorCallback(ExceptionListener fatalErrorCallback) {
+        this.fatalErrorCallback = fatalErrorCallback;
+    }
+
+
+    public void setErrorCallback(ExceptionListener errorCallback) {
+        this.errorCallback = errorCallback;
+    }
+
+    public boolean on(String route, MessageListener l) {
 
         if (routeCallbacks.get(route) != null) {
-            log.println("There is a duplicate entry of route " + route);
+            return false;
         }
 
         routeCallbacks.put(route, l);
+        return true;
     }
 
     ///////////////////////////////////////////////////////////////////////
@@ -502,7 +635,7 @@ public class Session implements Runnable {
             if (route != null) {
                 bRoute = route.getBytes();
                 if (bRoute.length > 255) {
-                    log.println("Route is too long.");
+                    onError(new RouteLengthTooLong());
                     return null;
                 } else {
                     msgLen += bRoute.length;
@@ -690,15 +823,33 @@ public class Session implements Runnable {
         void call(JsonObject obj);
     }
 
-    /*******************
-     *  CALLBACKS: (apart from routing)
-     *  - onHandshake
-     *  - onHeartbeatReceived
-     *  - onClose
-     *  - onKick
-     *  - onFatalError
-     *  -
-     *
-     */
+    public interface CallbackListener {
+        void call();
+    }
+
+
+    public interface ExceptionListener {
+        void call(Exception e);
+    }
+
+    public class OldClientException extends HandshakeException {
+        private OldClientException() {
+            super("Client is outdated.");
+        }
+    }
+
+    public class ServerTimeoutException extends Exception {}
+    public class InvalidMessageException extends Exception {}
+    public class RouteLengthTooLong extends Exception {}
+
+    public class HandshakeException extends Exception {
+        private HandshakeException() {
+            super();
+        }
+
+        private HandshakeException(String message) {
+            super(message);
+        }
+    }
 
 }

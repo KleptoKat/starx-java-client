@@ -6,7 +6,7 @@ public class Main {
 
     public static void main(String[] args) {
 	// write your code here
-        Tests.itConnectsToTheServer();
+        Tests.itConnectsToTheServerAndRegisters();
 
         Scanner scanner = new Scanner(System.in);
         scanner.nextLine();

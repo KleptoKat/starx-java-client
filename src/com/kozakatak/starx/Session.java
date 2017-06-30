@@ -1,10 +1,16 @@
-package com.kozakatak;
+package com.kozakatak.starx;
 
-import java.io.*;
+import com.google.gson.*;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PrintStream;
 import java.net.Socket;
 import java.util.*;
 
-import com.google.gson.*;
+
+
 
 /**
  * Created by Kozak on 2017-06-26.
@@ -83,6 +89,11 @@ public class Session implements Runnable {
 
     public boolean connect() {
 
+
+        if (connected) {
+            return true;
+        }
+
         log.println("Connecting...");
 
         try {
@@ -106,6 +117,10 @@ public class Session implements Runnable {
         return true;
     }
 
+
+    public boolean isConnected() {
+        return true;
+    }
 
     public void close() {
         this.connected = false;
@@ -293,8 +308,12 @@ public class Session implements Runnable {
     ///////////////////////////////////////////////////////////////////////
 
 
-    public void notify(String route, MessageListener cb) { notify(route, new JsonObject(), cb); }
-    public void notify(String route, JsonObject data, MessageListener cb) {
+    public void notify(String route) { notify(route, new JsonObject()); }
+    public void notify(String route, JsonObject data) {
+        if (!connected) {
+            return;
+        }
+
         byte[] msg = encodeMessage(0, TYPE_REQUEST, route, data);
         if (msg != null) {
             send(TYPE_DATA, msg);
@@ -304,6 +323,9 @@ public class Session implements Runnable {
 
     public void request(String route, MessageListener cb) { request(route, new JsonObject(), cb); }
     public void request(String route, JsonObject data, MessageListener cb) {
+        if (!connected) {
+            return;
+        }
         int id = lastMessageID++;
 
         byte[] msg = encodeMessage(id, TYPE_REQUEST, route, data);
@@ -369,6 +391,7 @@ public class Session implements Runnable {
 
 
     public void on(String route, MessageListener l) {
+
         if (routeCallbacks.get(route) != null) {
             log.println("There is a duplicate entry of route " + route);
         }

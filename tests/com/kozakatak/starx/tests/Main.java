@@ -1,8 +1,5 @@
-package com.kozakatak;
+package com.kozakatak.starx.tests;
 
-import com.kozakatak.starx.tests.Tests;
-
-import java.io.IOException;
 import java.util.Scanner;
 
 public class Main {

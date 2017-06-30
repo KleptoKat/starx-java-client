@@ -1,7 +1,7 @@
 package com.kozakatak.starx.tests;
 
 import com.google.gson.JsonObject;
-import com.kozakatak.Session;
+import com.kozakatak.starx.Session;
 
 import java.util.Timer;
 import java.util.TimerTask;
@@ -44,7 +44,11 @@ public class Tests {
 
     public static void itConnectsToTheServer() {
         Session s = new Session("localhost", 3250);
-        s.connect();
+        if (!s.connect()) {
+            return;
+        }
+
+
 
         s.on("JoinGame", new JoinGame());
         s.on("SearchStateMessage", new OnSearchStateMessage());
